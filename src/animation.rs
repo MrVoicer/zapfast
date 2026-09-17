@@ -86,8 +86,11 @@ pub enum Frame {
     Unavailable,
 }
 
-/// Returns the current frame, starting decoding when needed. Schedules the next repaint.
-pub fn frame(ui: &egui::Ui, path: &Path, rect: egui::Rect) -> Frame {
+/// Returns the current frame, starting decoding when needed.
+///
+/// A visible but paused animation returns its first frame without scheduling
+/// another repaint. This keeps animated media idle until playback is wanted.
+pub fn frame(ui: &egui::Ui, path: &Path, rect: egui::Rect, animate: bool) -> Frame {
     // ScrollArea still lays out clipped rows. They must neither start decoders
     // nor keep the window repainting while their pixels are off screen.
     if !ui.is_rect_visible(rect) {
@@ -157,6 +160,9 @@ pub fn frame(ui: &egui::Ui, path: &Path, rect: egui::Rect) -> Frame {
     match entries.get_mut(path) {
         Some(Entry::Ready(playing)) => {
             playing.last_drawn = now;
+            if !animate {
+                return Frame::Ready(playing.frames[0].0.clone());
+            }
             let elapsed = now.duration_since(playing.started);
             let mut position =
                 Duration::from_nanos((elapsed.as_nanos() % playing.total.as_nanos()) as u64);
@@ -500,7 +506,7 @@ mod tests {
                     let rect =
                         egui::Rect::from_min_size(egui::pos2(0.0, 1000.0), egui::vec2(50.0, 50.0));
                     assert!(matches!(
-                        super::frame(ui, path, rect),
+                        super::frame(ui, path, rect, true),
                         super::Frame::Pending
                     ));
                 },
@@ -626,6 +632,60 @@ mod tests {
             .expect("saves");
         assert!(decode(&path).is_none());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_paused_animation_does_not_schedule_another_frame() {
+        let ctx = egui::Context::default();
+        let path = PathBuf::from("paused.gif");
+        let frames = [egui::Color32::WHITE, egui::Color32::BLACK]
+            .into_iter()
+            .enumerate()
+            .map(|(index, color)| {
+                (
+                    ctx.load_texture(
+                        format!("paused-frame-{index}"),
+                        ColorImage::new([1, 1], vec![color]),
+                        TextureOptions::LINEAR,
+                    ),
+                    Duration::from_millis(100),
+                )
+            })
+            .collect();
+        cache(&ctx).0.lock().expect("animation cache").insert(
+            path.clone(),
+            Entry::Ready(Playing {
+                frames,
+                total: Duration::from_millis(200),
+                started: Instant::now(),
+                last_drawn: Instant::now(),
+            }),
+        );
+        // Settle texture uploads before checking the paused frame itself.
+        for _ in 0..3 {
+            let mut output = ctx.run_ui(egui::RawInput::default(), |_| {});
+            output.textures_delta.clear();
+        }
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(200.0, 200.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(50.0, 50.0), egui::Sense::hover());
+                assert!(matches!(frame(ui, &path, rect, false), Frame::Ready(_)));
+            },
+        );
+        output.textures_delta.clear();
+        assert!(
+            !ctx.requested_repaint_last_pass(),
+            "a paused frame leaves the event loop idle: {:?}",
+            ctx.repaint_causes()
+        );
     }
 }
 
