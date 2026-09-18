@@ -44,6 +44,7 @@ struct Playing {
     total: Duration,
     started: Instant,
     last_drawn: Instant,
+    animating: bool,
 }
 
 enum Entry {
@@ -122,6 +123,7 @@ pub fn frame(ui: &egui::Ui, path: &Path, rect: egui::Rect, animate: bool) -> Fra
                     total: total.max(Duration::from_millis(50)),
                     started: Instant::now(),
                     last_drawn: Instant::now(),
+                    animating: false,
                 })
             }
             _ => Entry::Failed,
@@ -161,7 +163,12 @@ pub fn frame(ui: &egui::Ui, path: &Path, rect: egui::Rect, animate: bool) -> Fra
         Some(Entry::Ready(playing)) => {
             playing.last_drawn = now;
             if !animate {
+                playing.animating = false;
                 return Frame::Ready(playing.frames[0].0.clone());
+            }
+            if !playing.animating {
+                playing.started = now;
+                playing.animating = true;
             }
             let elapsed = now.duration_since(playing.started);
             let mut position =
@@ -635,7 +642,7 @@ mod tests {
     }
 
     #[test]
-    fn a_paused_animation_does_not_schedule_another_frame() {
+    fn a_paused_animation_stays_idle_and_restarts_at_the_first_frame() {
         let ctx = egui::Context::default();
         let path = PathBuf::from("paused.gif");
         let frames = [egui::Color32::WHITE, egui::Color32::BLACK]
@@ -648,17 +655,21 @@ mod tests {
                         ColorImage::new([1, 1], vec![color]),
                         TextureOptions::LINEAR,
                     ),
-                    Duration::from_millis(100),
+                    Duration::from_secs(60),
                 )
             })
-            .collect();
+            .collect::<Vec<_>>();
+        let first = frames[0].0.id();
         cache(&ctx).0.lock().expect("animation cache").insert(
             path.clone(),
             Entry::Ready(Playing {
                 frames,
-                total: Duration::from_millis(200),
-                started: Instant::now(),
+                total: Duration::from_secs(120),
+                // Without a playback-state reset, the next animated pass
+                // would land halfway through the second frame.
+                started: Instant::now() - Duration::from_secs(90),
                 last_drawn: Instant::now(),
+                animating: false,
             }),
         );
         // Settle texture uploads before checking the paused frame itself.
@@ -680,12 +691,22 @@ mod tests {
                 assert!(matches!(frame(ui, &path, rect, false), Frame::Ready(_)));
             },
         );
+        let delay = output.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
         output.textures_delta.clear();
         assert!(
-            !ctx.requested_repaint_last_pass(),
-            "a paused frame leaves the event loop idle: {:?}",
-            ctx.repaint_causes()
+            delay > Duration::from_secs(1),
+            "a paused frame requested another repaint after {delay:?}"
         );
+
+        let mut resumed = None;
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(50.0, 50.0), egui::Sense::hover());
+            if let Frame::Ready(texture) = frame(ui, &path, rect, true) {
+                resumed = Some(texture.id());
+            }
+        });
+        output.textures_delta.clear();
+        assert_eq!(resumed, Some(first));
     }
 }
 
